@@ -51,7 +51,7 @@ from bs4 import BeautifulSoup
 #  KONFIGURASI
 # ─────────────────────────────────────────────
 
-MINE_API       = "https://tapi.awp.sh/api"          # WorkNet coordinator API
+MINE_API       = "https://api.minework.net"              # WorkNet coordinator API
 AGENT_ID       = os.getenv("AWP_AGENT_ID", "default")
 SESSION_DUR    = 3600 * 8                             # 8 jam
 HEARTBEAT_SEC  = 55                                   # kirim heartbeat tiap 55 detik
@@ -89,7 +89,7 @@ class AWPWallet:
         return json.loads(result.stdout.strip())
 
     def unlock(self, duration: int = SESSION_DUR) -> str:
-        data = self._run("unlock", "--duration", str(duration))
+        data = self._run("unlock", "--duration", str(duration), "--scope", "full")
         self._token = data["sessionToken"]
         self.address = self.get_address()
         log.info(f"Wallet unlocked — {self.address}")
