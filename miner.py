@@ -103,7 +103,9 @@ class AWPWallet:
         log.info("Wallet locked.")
 
     def get_address(self) -> str:
-        return self._run("wallet-id")["address"]
+        data = self._run("wallets")
+        wallet_id = data["currentWalletId"]
+        return data["wallets"][wallet_id]["address"]
 
     def sign_message(self, message: str) -> str:
         if not self._token:
