@@ -78,7 +78,6 @@ log = logging.getLogger("mine-miner")
 class AWPWallet:
     def __init__(self, agent_id: str = "default"):
         self.agent_id = agent_id
-        self._token: str | None = None
         self.address: str | None = None
 
     def _run(self, *args) -> dict:
@@ -90,10 +89,10 @@ class AWPWallet:
 
     def unlock(self, duration: int = SESSION_DUR) -> str:
         data = self._run("unlock", "--duration", str(duration), "--scope", "full")
-        self._token = data["sessionToken"]
+        token = data["sessionToken"]
         self.address = self.get_address()
         log.info(f"Wallet unlocked — {self.address}")
-        return self._token
+        return token
 
     def lock(self):
         try:
@@ -107,64 +106,169 @@ class AWPWallet:
         wallet_id = data["currentWalletId"]
         return data["wallets"][wallet_id]["address"]
 
-    def sign_message(self, message: str) -> str:
-        if not self._token:
-            raise RuntimeError("Wallet belum di-unlock!")
-        data = self._run("sign-message", "--token", self._token, "--message", message)
-        return data["signature"]
+    def sign_typed_data(self, typed_data: dict) -> str:
+        """EIP-712 signing via awp-wallet sign-typed-data."""
+        data_json = json.dumps(typed_data, separators=(",", ":"))
+        resp = self._run("sign-typed-data", "--data", data_json)
+        sig = resp.get("signature", "")
+        if not sig:
+            raise RuntimeError("sign-typed-data returned empty signature")
+        return sig
 
 
 # ─────────────────────────────────────────────
-#  AUTH SESSION
+#  EIP-712 AUTH
 # ─────────────────────────────────────────────
 
+import secrets
 import ssl
-import urllib3
+from urllib.parse import urlsplit
 from requests.adapters import HTTPAdapter
 
+# Signature config cache (diisi dari API)
+_SIG_CONFIG: dict = {}
+
+def _fetch_sig_config() -> dict:
+    global _SIG_CONFIG
+    if _SIG_CONFIG:
+        return _SIG_CONFIG
+    try:
+        r = requests.get(f"{MINE_API}/api/public/v1/signature-config", timeout=10)
+        if r.ok:
+            _SIG_CONFIG = r.json().get("data", {})
+            log.info(f"Signature config: chain_id={_SIG_CONFIG.get('chain_id')}, domain={_SIG_CONFIG.get('domain_name')}")
+    except Exception as e:
+        log.warning(f"Gagal fetch signature config: {e}")
+    return _SIG_CONFIG
+
+
+def _keccak256(data: bytes) -> bytes:
+    """Keccak-256. Butuh: pip install pysha3"""
+    import hashlib
+    try:
+        import sha3  # noqa — patches hashlib agar sha3_256 = Keccak-256
+    except ImportError:
+        log.warning("pysha3 tidak terinstall! Jalankan: pip install pysha3")
+    h = hashlib.new("sha3_256")
+    h.update(data)
+    return h.digest()
+
+
+def _keccak_hex(data: bytes) -> str:
+    return "0x" + _keccak256(data).hex()
+
+
+def _hash_body(body: Any, content_type: str) -> str:
+    if body is None:
+        return _keccak_hex(b"")
+    s = json.dumps(body, separators=(",", ":"))
+    return _keccak_hex(s.encode("utf-8"))
+
+
+def _hash_query(url: str) -> str:
+    query = urlsplit(url).query or ""
+    return _keccak_hex(query.encode("utf-8"))
+
+
+def _hash_headers(headers: dict, signed_headers: tuple) -> str:
+    parts = [f"{h.lower()}:{headers.get(h.lower(), headers.get(h, ''))}" for h in signed_headers]
+    return _keccak_hex("\n".join(parts).encode("utf-8"))
+
+
+def build_eip712_auth_headers(method: str, url: str, body: Any, wallet: AWPWallet) -> dict:
+    """Build EIP-712 signed headers untuk Mine API."""
+    cfg = _fetch_sig_config()
+    chain_id         = int(cfg.get("chain_id", cfg.get("chainId", 8453)))
+    domain_name      = cfg.get("domain_name", cfg.get("domainName", "Mine"))
+    domain_version   = cfg.get("domain_version", cfg.get("domainVersion", "1"))
+    verifying_contract = cfg.get("verifying_contract", cfg.get("verifyingContract", "0x0000000000000000000000000000000000000000"))
+    content_type     = "application/json"
+    signed_headers   = ("content-type",)
+
+    now   = int(time.time())
+    nonce = secrets.randbits(52)
+    split = urlsplit(url)
+    req_headers = {"content-type": content_type}
+
+    typed_data = {
+        "types": {
+            "EIP712Domain": [
+                {"name": "name",              "type": "string"},
+                {"name": "version",           "type": "string"},
+                {"name": "chainId",           "type": "uint256"},
+                {"name": "verifyingContract", "type": "address"},
+            ],
+            "APIRequest": [
+                {"name": "method",      "type": "string"},
+                {"name": "host",        "type": "string"},
+                {"name": "path",        "type": "string"},
+                {"name": "queryHash",   "type": "bytes32"},
+                {"name": "headersHash", "type": "bytes32"},
+                {"name": "bodyHash",    "type": "bytes32"},
+                {"name": "nonce",       "type": "uint256"},
+                {"name": "issuedAt",    "type": "uint256"},
+                {"name": "expiresAt",   "type": "uint256"},
+            ],
+        },
+        "primaryType": "APIRequest",
+        "domain": {
+            "name":              domain_name,
+            "version":           domain_version,
+            "chainId":           chain_id,
+            "verifyingContract": verifying_contract,
+        },
+        "message": {
+            "method":      method.upper(),
+            "host":        split.netloc,
+            "path":        split.path or "/",
+            "queryHash":   _hash_query(url),
+            "headersHash": _hash_headers(req_headers, signed_headers),
+            "bodyHash":    _hash_body(body, content_type),
+            "nonce":       nonce,
+            "issuedAt":    now,
+            "expiresAt":   now + 300,
+        },
+    }
+
+    sig = wallet.sign_typed_data(typed_data)
+    return {
+        "Content-Type":      content_type,
+        "X-Signer":          wallet.address,
+        "X-Signature":       sig if sig.startswith("0x") else f"0x{sig}",
+        "X-Nonce":           str(nonce),
+        "X-Issued-At":       str(now),
+        "X-Expires-At":      str(now + 300),
+        "X-Chain-Id":        str(chain_id),
+        "X-Signed-Headers":  ",".join(signed_headers),
+    }
+
+
 class TLSAdapter(HTTPAdapter):
-    """Force TLS 1.2+ dan disable legacy options yang bikin SSL EOF."""
+    """Force TLS 1.2+ untuk fix SSL EOF di beberapa VPS."""
     def init_poolmanager(self, *args, **kwargs):
         ctx = ssl.create_default_context()
         ctx.set_ciphers("DEFAULT@SECLEVEL=1")
         ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        ctx.check_hostname = True
-        ctx.verify_mode = ssl.CERT_REQUIRED
         kwargs["ssl_context"] = ctx
         super().init_poolmanager(*args, **kwargs)
 
 
 class MineSession(requests.Session):
-    """requests.Session dengan EIP-191 auth untuk Mine API."""
+    """requests.Session dengan EIP-712 auth untuk Mine API."""
 
     def __init__(self, wallet: AWPWallet):
         super().__init__()
         self.wallet = wallet
-        self.headers.update({
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "User-Agent": "MineBot/1.0",
-        })
-        adapter = TLSAdapter()
-        self.mount("https://", adapter)
-
-    def _auth_headers(self) -> dict:
-        ts = str(int(time.time()))
-        addr = self.wallet.address.lower()
-        msg = f"mine-auth:{addr}:{ts}"
-        sig = self.wallet.sign_message(msg)
-        return {
-            "X-AWP-Address":   self.wallet.address,
-            "X-AWP-Timestamp": ts,
-            "X-AWP-Signature": sig,
-        }
+        self.headers.update({"Accept": "application/json", "User-Agent": "MineBot/1.0"})
+        self.mount("https://", TLSAdapter())
 
     def request(self, method, url, **kwargs):
-        extra_headers = self._auth_headers()
+        body = kwargs.get("json")
+        auth = build_eip712_auth_headers(method, url, body, self.wallet)
         if "headers" in kwargs:
-            kwargs["headers"].update(extra_headers)
+            kwargs["headers"].update(auth)
         else:
-            kwargs["headers"] = extra_headers
+            kwargs["headers"] = auth
         return super().request(method, url, **kwargs)
 
 
@@ -408,32 +512,31 @@ class MineClient:
         self.s = session
 
     def get_datasets(self) -> list[dict]:
-        """Ambil daftar DataSet yang aktif."""
-        r = self.s.get(f"{MINE_API}/mine/datasets", params={"status": "active"}, timeout=10)
+        """GET /api/core/v1/datasets"""
+        r = self.s.get(f"{MINE_API}/api/core/v1/datasets", timeout=10)
         r.raise_for_status()
-        data = r.json()
-        return data if isinstance(data, list) else data.get("datasets", [])
+        body = r.json()
+        data = body.get("data", body)
+        if isinstance(data, list):
+            return [d for d in data if isinstance(d, dict)]
+        if isinstance(data, dict):
+            items = data.get("items", [])
+            return [d for d in items if isinstance(d, dict)]
+        return []
 
-    def get_task(self, dataset_id: str) -> dict | None:
-        """Ambil 1 task (URL) dari DataSet tertentu."""
+    def submit_task(self, dataset_id: str, url: str, cleaned: str, structured: dict) -> dict:
+        """POST /api/mining/v1/submissions"""
         r = self.s.post(
-            f"{MINE_API}/mine/tasks/claim",
-            json={"datasetId": dataset_id},
-            timeout=10,
-        )
-        if r.status_code == 204:  # Tidak ada task tersedia
-            return None
-        r.raise_for_status()
-        return r.json()
-
-    def submit_task(self, task_id: str, cleaned: str, structured: dict) -> dict:
-        """Submit hasil crawl ke coordinator."""
-        r = self.s.post(
-            f"{MINE_API}/mine/tasks/{task_id}/submit",
+            f"{MINE_API}/api/mining/v1/submissions",
             json={
-                "cleanedData": cleaned,
-                "structuredData": structured,
-                "submittedAt": datetime.now(timezone.utc).isoformat(),
+                "dataset_id": dataset_id,
+                "entries": [
+                    {
+                        "url": url,
+                        "cleaned_data": cleaned,
+                        "structured_data": structured,
+                    }
+                ],
             },
             timeout=15,
         )
@@ -441,16 +544,22 @@ class MineClient:
         return r.json()
 
     def send_heartbeat(self) -> None:
-        """Kirim heartbeat agar dianggap online (tiap <60 detik)."""
+        """POST /api/mining/v1/heartbeat"""
         try:
-            self.s.post(f"{MINE_API}/mine/heartbeat", timeout=5)
+            self.s.post(
+                f"{MINE_API}/api/mining/v1/heartbeat",
+                json={"client": "mine-bot"},
+                timeout=5,
+            )
         except Exception:
             pass
 
-    def get_my_stats(self, address: str) -> dict:
-        r = self.s.get(f"{MINE_API}/mine/miners/{address}", timeout=10)
+    def get_my_stats(self) -> dict:
+        """GET /api/mining/v1/miners/me/stats"""
+        r = self.s.get(f"{MINE_API}/api/mining/v1/miners/me/stats", timeout=10)
         r.raise_for_status()
-        return r.json()
+        body = r.json()
+        return body.get("data", body)
 
 
 # ─────────────────────────────────────────────
@@ -485,11 +594,9 @@ class Miner:
             return None
         return random.choice(active)
 
-    def process_task(self, task: dict, schema: dict) -> bool:
-        """Jalankan pipeline 3 stage untuk 1 task. Return True jika berhasil."""
-        url     = task.get("url", "")
-        task_id = task.get("id") or task.get("taskId", "")
-        log.info(f"  Task {task_id} — {url}")
+    def process_task(self, url: str, dataset_id: str, schema: dict) -> bool:
+        """Jalankan pipeline 3 stage untuk 1 URL. Return True jika berhasil."""
+        log.info(f"  URL — {url}")
 
         try:
             # Stage 1: Crawl
@@ -510,9 +617,9 @@ class Miner:
             log.info(f"    Stage 3 ✓ ({filled}/{total} field terisi)")
 
             # Submit
-            result = self.client.submit_task(task_id, cleaned, structured)
-            status = result.get("status", "?")
-            log.info(f"    Submit  ✓ status={status}")
+            result = self.client.submit_task(dataset_id, url, cleaned, structured)
+            data = result.get("data", result)
+            log.info(f"    Submit  ✓ {data}")
             return True
 
         except requests.HTTPError as e:
@@ -523,6 +630,8 @@ class Miner:
 
     def run_epoch(self):
         """Jalankan satu epoch mining sampai target atau waktu habis."""
+        import random
+
         log.info("=" * 55)
         log.info(f"  MULAI EPOCH — target {MIN_TASKS}+ submission")
         log.info("=" * 55)
@@ -532,32 +641,38 @@ class Miner:
             log.error("Tidak ada DataSet aktif!")
             return
 
-        log.info(f"DataSet aktif: {len(datasets)}")
-        for ds in datasets:
+        # Filter active only
+        active_datasets = [d for d in datasets if d.get("status") in ("active", None)]
+        if not active_datasets:
+            active_datasets = datasets  # fallback jika status tidak ada
+
+        log.info(f"DataSet tersedia: {len(active_datasets)}")
+        for ds in active_datasets:
             log.info(f"  • {ds.get('name', ds.get('id'))} — {ds.get('description', '')[:60]}")
 
         while self.task_count < MAX_TASKS:
             self.heartbeat_if_needed()
 
-            dataset = self.pick_dataset(datasets)
-            if not dataset:
-                log.warning("Tidak ada DataSet tersedia, tunggu 30 detik...")
-                time.sleep(30)
-                continue
-
+            dataset = random.choice(active_datasets)
             schema    = dataset.get("schema", {})
             ds_name   = dataset.get("name", dataset.get("id"))
             ds_id     = dataset.get("id", "")
 
-            log.info(f"\n[{self.task_count + 1}/{MAX_TASKS}] Dataset: {ds_name}")
-            task = self.client.get_task(ds_id)
-
-            if task is None:
-                log.info("  Tidak ada task tersedia, ganti DataSet...")
+            # Ambil URL dari source_domains dataset
+            source_domains = dataset.get("source_domains") or dataset.get("sourceDomains") or []
+            if not source_domains:
+                log.warning(f"  Dataset {ds_name} tidak punya source_domains, skip")
                 time.sleep(5)
                 continue
 
-            ok = self.process_task(task, schema)
+            # Pilih domain acak dan buat URL seed
+            domain = random.choice(source_domains)
+            if not domain.startswith("http"):
+                domain = f"https://{domain}"
+            url = domain
+
+            log.info(f"\n[{self.task_count + 1}/{MAX_TASKS}] Dataset: {ds_name} | URL: {url}")
+            ok = self.process_task(url, ds_id, schema)
             self.task_count  += 1
             if ok:
                 self.success_count += 1
@@ -579,13 +694,13 @@ class Miner:
 
     def show_stats(self):
         try:
-            stats = self.client.get_my_stats(self.wallet.address)
+            stats = self.client.get_my_stats()
             log.info("\n📊 Stats kamu di Mine:")
-            log.info(f"  Credit score : {stats.get('creditScore', 'N/A')}")
+            log.info(f"  Credit score : {stats.get('credit_score', stats.get('creditScore', 'N/A'))}")
             log.info(f"  Tier         : {stats.get('tier', 'N/A')}")
-            log.info(f"  Total tasks  : {stats.get('totalTasks', 'N/A')}")
-            log.info(f"  Avg score    : {stats.get('avgScore', 'N/A')}")
-            log.info(f"  Total reward : {stats.get('totalReward', 'N/A')} $aMine")
+            log.info(f"  Total tasks  : {stats.get('total_tasks', stats.get('totalTasks', 'N/A'))}")
+            log.info(f"  Avg score    : {stats.get('avg_score', stats.get('avgScore', 'N/A'))}")
+            log.info(f"  Total reward : {stats.get('total_rewards', stats.get('totalReward', 'N/A'))} $aMine")
         except Exception as e:
             log.warning(f"Tidak bisa fetch stats: {e}")
 
