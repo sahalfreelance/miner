@@ -82,7 +82,7 @@ class AWPWallet:
         self.address: str | None = None
 
     def _run(self, *args) -> dict:
-        cmd = ["awp-wallet", *args, "--agent-id", self.agent_id]
+        cmd = ["awp-wallet", *args]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
             raise RuntimeError(f"awp-wallet error: {result.stderr.strip()}")
