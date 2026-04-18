@@ -118,6 +118,22 @@ class AWPWallet:
 #  AUTH SESSION
 # ─────────────────────────────────────────────
 
+import ssl
+import urllib3
+from requests.adapters import HTTPAdapter
+
+class TLSAdapter(HTTPAdapter):
+    """Force TLS 1.2+ dan disable legacy options yang bikin SSL EOF."""
+    def init_poolmanager(self, *args, **kwargs):
+        ctx = ssl.create_default_context()
+        ctx.set_ciphers("DEFAULT@SECLEVEL=1")
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        ctx.check_hostname = True
+        ctx.verify_mode = ssl.CERT_REQUIRED
+        kwargs["ssl_context"] = ctx
+        super().init_poolmanager(*args, **kwargs)
+
+
 class MineSession(requests.Session):
     """requests.Session dengan EIP-191 auth untuk Mine API."""
 
@@ -127,7 +143,10 @@ class MineSession(requests.Session):
         self.headers.update({
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "User-Agent": "MineBot/1.0",
         })
+        adapter = TLSAdapter()
+        self.mount("https://", adapter)
 
     def _auth_headers(self) -> dict:
         ts = str(int(time.time()))
